@@ -1,0 +1,287 @@
+#!/bin/sh
+
+set -eu
+
+eval $(setprognamedir "$0")
+
+. "${progdir_?}msg.sh"
+. "${progdir_?}create_freebsd_zroot.sh"
+
+: ${JAIL_CMD:="/usr/sbin/jail"}
+: ${JAIL_ROOT:="${ALTROOT-}/jails"}
+: ${JAIL_CONF:="${ALTROOT-}/etc/jail.conf"}
+: ${JAIL_CONF_D:="${ALTROOT-}/etc/jail.conf.d"}
+: ${PKG_CMD:="/usr/sbin/pkg"}
+: ${CP_CMD:="/bin/cp"}
+: ${CPIO_CMD:="/usr/bin/cpio"}
+: ${TAR_CMD:="/usr/bin/tar"}
+: ${FIND_CMD:="/usr/bin/find"}
+: ${SORT_CMD:="/usr/bin/sort"}
+: ${GREP_CMD:="/usr/bin/grep"}
+: ${TR_CMD:="/usr/bin/tr"}
+: ${DF_CMD:="/bin/df"}
+: ${XARGS_CMD:="/usr/bin/xargs"}
+: ${REALPATH_CMD:="/bin/realpath"}
+: ${INSTALL_CMD:="/usr/bin/install"}
+: ${DATE_CMD:="/bin/date"}
+: ${ETCUPDATE_CMD:="/usr/sbin/etcupdate"}
+: ${SYSRC_CMD:="/usr/sbin/sysrc"}
+: ${JQ_CMD="/usr/local/bin/jq"}
+: ${ZFS_CMD="/sbin/zfs"}
+: ${PKGBASE_REPO_NAME:="FreeBSD-base"}
+: ${PKGBASE_PKGS:="FreeBSD-set-minimal-jail"}
+: ${PKGFORMAT:="pkg"}
+: ${MKJAIL_CONF_DIR:="${ALTROOT-}/etc/mkjail"}
+: ${MKJAIL_CONFIG:="${MKJAIL_CONF_DIR}/config.sh"}
+
+if [ -f "${MKJAIL_CONFIG}" ]
+then
+	. "${MKJAIL_CONFIG}" || exit
+fi
+
+unset -v newline
+newline="
+"
+
+true() { return 0; }
+false() { return 1; }
+
+jail_pkg() {
+	${PKG_CMD} -r "${jail_path}" "$@"
+}
+
+validate_jail_name() {
+	case "${1-}" in
+	"" | *.*) return 1;;
+	*) return 0;;
+	esac
+}
+
+validate_zfs_name() {
+	debug "validating ZFS name [${1-}]"
+	case "${1-}" in
+	"" | /* | \ * | */ | *//* | *[!A-Za-z0-9/\ .:_-]*) return 1;;
+	esac
+	return 0
+}
+
+debug_var() {
+	local v
+	for v
+	do
+		eval "debug \"${v}=\${${v}}\""
+	done
+}
+
+do_jail() {
+	local jail jail_in_path jail_path pkgbase_pkgs pkg_nv pkg_cachedir root_fs data_fs jail_conf zfs_datasets zfs_dataset
+	validate_jail_name "${jail}" || { err "invalid jail name ${jail}"; return 64; }
+	debug "creating jail: ${jail}"
+	jail_in_path=$(echo -n "${jail}" | ${TR_CMD} -c "[:alnum:]/:_-" -) || return
+	jail_path="${JAIL_ROOT}/${jail_in_path}${JAIL_ROOT_FS_SUFFIX}"
+	jail_conf="${JAIL_CONF_D}/${jail_in_path}.conf"
+	pkgbase_pkgs="${PKGBASE_PKGS}"
+	zfs_datasets=""
+	if use_zfs_root
+	then
+		root_fs="${JAIL_ROOT_FS}/${jail_in_path}${JAIL_ROOT_FS_SUFFIX}"
+		debug "creating jail root ZFS filesystem: ${root_fs}"
+		${ZFS_CMD} create "${root_fs}" || return
+		case "$(
+			${DF_CMD} --libxo=json "${jail_path}" |
+			${JQ_CMD} -r '."storage-system-information".filesystem[].name'
+		)" in
+		"${root_fs}" | "${root_fs}"/*) ;;
+		*) err "root filesystem ${root_fs} is not mounted at ${jail_path}"; return 69;;
+		esac
+		if use_zfs_hierarchy
+		then
+			debug "creating jail root ZFS filesystem hierarchy"
+			create_freebsd_zroot "${root_fs}"
+		fi
+	fi
+	if use_zfs_dataset
+	then
+		pkgbase_pkgs="${pkgbase_pkgs} FreeBSD-zfs"
+		data_fs="${JAIL_DATA_FS}/${jail_in_path}${JAIL_DATA_FS_SUFFIX}"
+		zfs_datasets="${zfs_datasets} ${data_fs}"
+		debug "creating jail data ZFS filesystem: ${data_fs}"
+		${ZFS_CMD} create -o jailed=on -o canmount=off -o mountpoint=/ "${data_fs}" || return
+	fi
+	debug "preparing jail root path: ${jail_path}"
+	${INSTALL_CMD} -d -o root -g wheel -m 755 "${jail_path}" || return
+	jail_path=$(${REALPATH_CMD} "${jail_path}") || return
+	debug "canonical jail root path: ${jail_path}"
+	debug "copying pkg(8) repository config from host"
+	(
+		cd / &&
+		{
+			${PKG_CMD} config REPOS_DIR
+			${PKG_CMD} list FreeBSD-pkg-bootstrap | ${GREP_CMD} -e '^/usr/share/keys/' -e '/etc/pkg/'
+		} |
+		${TR_CMD} \\n \\0 |
+		${XARGS_CMD} -0 -J {} ${FIND_CMD} -d {} -print0 |
+		${CPIO_CMD} -pdum0 --quiet "${jail_path}"
+	) || return
+	debug "installing PkgBase packages: ${pkgbase_pkgs}"
+	jail_pkg install -r "${PKGBASE_REPO_NAME}" -q -y ${pkgbase_pkgs} || return
+#	debug "bootstrapping etcupdate(8)"
+#	pkg_cachedir=$(jail_pkg config PKG_CACHEDIR) &&
+#	jail_pkg query "%n-%v" |
+#	while read -r pkg_nv
+#	do
+#		${TAR_CMD} -xqO -f "${pkg_cachedir}/${pkg_nv}.${PKGFORMAT}" +MANIFEST |
+#		${JQ_CMD} -r '.config[]?' || :
+#	done |
+#	${SORT_CMD} -u -t/ |
+#	${TAR_CMD} -cf- -C "${jail_path}" -nT- |
+#	${ETCUPDATE_CMD} extract -D "${jail_path}" -t- || return
+	debug "setting up fstab"
+	cat << ENDEND > "/etc/jail.fstab.d/${jail_in_path}.fstab"
+# source	mountpoint			type	options		freq pass
+#/var/cache/pkg ${jail_path#"${ALTROOT-}"}/var/cache/pkg nullfs ro		0    0
+ENDEND
+	if use_zfs_dataset
+	then
+		debug "enabling ZFS in jail"
+		${SYSRC_CMD} -R "${jail_path}" zfs_enable="YES" || return
+	fi
+	local include_line
+	debug "registering jail in ${jail_conf}"
+	include_line=".include \"${JAIL_CONF_D#"${ALTROOT-}"}/*.conf\";"
+	${GREP_CMD} -qFx "${include_line}" "${JAIL_CONF}" || echo "${include_line}" >> "${JAIL_CONF}" || return
+	if [ -f "${jail_conf}" ]
+	then
+		local jail_conf_bak
+		jail_conf_bak="${jail_conf}.$(${DATE_CMD} -u +%Y%m%dT%H%M%S)" || return
+		notice "backing up old config as ${jail_conf_bak}"
+		${CP_CMD} -p "${jail_conf}" "${jail_conf_bak}" || return
+	fi
+	{
+		local allow_mount allow_mount_zfs enforce_statfs
+		allow_mount=
+		allow_mount_zfs=
+		enforce_statfs=
+		if use_zfs_dataset
+		then
+			allow_mount=true
+			allow_mount_zfs=true
+			enforce_statfs=1
+		fi
+		cat << ENDEND
+${jail} {${allow_mount:+
+	allow.mount;}${allow_mount_zfs:+
+	allow.mount.zfs;}${enforce_statfs:+
+	enforce_statfs	 = ${enforce_statfs};}
+ENDEND
+		for zfs_dataset in ${zfs_datasets}
+		do
+			echo "	zfs.dataset	+= \"${zfs_dataset}\";"
+		done
+		echo "}"
+	} > "${jail_conf}"
+	notice "created jail ${jail}"
+}
+
+configure_jail_root_fs() {
+	case "${JAIL_ROOT_FS+set}" in
+	"")
+		JAIL_ROOT_FS=$(
+			zfs list -Hpo name,mountpoint | \
+			awk -v root="${JAIL_ROOT}" -F '	' '
+				$2 == root { print $1; }
+			'
+		)
+		case "${JAIL_ROOT_FS}" in
+		"")
+			err "no ZFS dataset has mountpoint ${JAIL_ROOT}"
+			return 78
+			;;
+		*"${newline}"*)
+			err "multiple datasets have the jail root mountpoint ${JAIL_ROOT}: $(
+				echo -n "${JAIL_ROOT_FS}" |
+				tr "${newline}" @ | sed 's/@/, /'
+			)"
+			err "set the JAIL_ROOT_FS environment variable to pick one"
+			return 78
+			;;
+		esac
+		info "${JAIL_ROOT} is on ${JAIL_ROOT_FS}"
+		;;
+	esac
+	validate_zfs_name "${JAIL_ROOT_FS}" || { err "invalid JAIL_ROOT_FS [${JAIL_ROOT_FS}]"; return 78; }
+	: "${JAIL_ROOT_FS_SUFFIX="/root"}"
+	return 0
+}
+
+configure_jail_data_fs() {
+	case "${JAIL_DATA_FS+set}" in
+	"")
+		configure_jail_root_fs || return
+		JAIL_DATA_FS="${JAIL_ROOT_FS}"
+		;;
+	esac
+	validate_zfs_name "${JAIL_DATA_FS}" || { err "invalid JAIL_DATA_FS [${JAIL_DATA_FS}]"; return 78; }
+	: "${JAIL_DATA_FS_SUFFIX="/data"}"
+	return 0
+}
+
+print_usage() {
+	cat << ENDEND
+usage: ${progname} [flags] JAIL ...
+-z	create and use ZFS filesystem as jail root
+-Z	create and use root-on-ZFS hierarchy as jail root
+-D	create and use ZFS filesystem as jail data
+ENDEND
+}
+
+usage() {
+	err "$@"
+	print_usage >&2
+	exit 64
+}
+
+use_zfs_root() {
+	return $((USE_ZFS_ROOT <= 0))
+}
+
+use_zfs_hierarchy() {
+	return $((USE_ZFS_ROOT <= 1))
+}
+
+use_zfs_dataset() {
+	return $((USE_ZFS_DATASET <= 0))
+}
+
+main() {
+	: ${USE_ZFS_ROOT:=0}
+	: ${USE_ZFS_DATASET:=0}
+	log_level=${LOG_LEVEL-notice}
+	local opt OPTIND
+	while getopts :hzdZDL: opt
+	do
+		case "${opt}" in
+			'?') usage "unrecognized option -${OPTARG}";;
+			':') usage "missing argument for -${OPTARG}";;
+			h) print_usage; exit;;
+			z) USE_ZFS_ROOT=$((USE_ZFS_ROOT + 1));;
+			Z) USE_ZFS_ROOT=0;;
+			d) USE_ZFS_DATASET=$((USE_ZFS_DATASET + 1));;
+			D) USE_ZFS_DATASET=0;;
+			L) log_level="${OPTARG}";;
+			*) ex_software "unhandled option -${opt}";;
+		esac
+	done
+	shift $((OPTIND - 1))
+	use_zfs_root && { configure_jail_root_fs || return; }
+	use_zfs_dataset && { configure_jail_data_fs || return; }
+	local jail failed
+	failed=
+	for jail
+	do
+		do_jail || failed=$((${failed-0} + 1))
+	done
+	info "all done${failed:+" (${failed} failed)"}"
+}
+
+main "$@"

@@ -1,0 +1,240 @@
+#!/bin/sh
+
+set -eu
+
+eval $(setprognamedir "$0")
+
+. "${progdir_?}msg.sh"
+
+: ${JAIL_CMD:="/usr/sbin/jail"}
+: ${SYSRC_CMD:="/usr/sbin/sysrc"}
+: ${IPADDR_CMD:="/usr/local/bin/ipaddr"}
+: ${GETADDRINFO_CMD:="/usr/bin/getaddrinfo"}
+: ${GREP_CMD:="/usr/bin/grep"}
+: ${SED_CMD:="/usr/bin/sed"}
+: ${TR_CMD:="/usr/bin/tr"}
+: ${CUT_CMD:="/usr/bin/cut"}
+: ${SORT_CMD:="/usr/bin/sort"}
+: ${MKTEMP_CMD:="/usr/bin/mktemp"}
+: ${NETJAIL_CONF_DIR:="${ALTROOT-}/etc/netjail"}
+
+${IPADDR_CMD} 1.2.3.4 > /dev/null || ex_unavailable "${IPADDR_CMD} unavailable - please install from ports"
+
+unset -v newline
+newline="
+"
+
+escape_ere() { # var
+	local _v _r _pfx _sfx
+	eval "_v=\"\${${1}}\""
+	_r=""
+	while :
+	do
+		_pfx="${_v%%[][\\.?*+{\}()|]*}"
+		case "${_pfx}" in
+		"${_v}")
+			_r="${_r}${_v}"
+			break
+			;;
+		esac
+		_r="${_r}${_pfx}"
+		_v="${_v#"${_pfx}"}"
+		_sfx="${_v#?}"
+		_r="${_r}\\${_v%"${_sfx}"}"
+		_v="${_sfx}"
+	done
+	eval "${1}=\"\${_r}\""
+}
+
+jail_e="$(${JAIL_CMD} -e ' ')"
+
+get_jail_param() { # jail param
+	local jail jail_ere param param_ere
+	jail="${1}"
+	param="${2}"
+	jail_ere="${jail}"
+	param_ere="${param}"
+	escape_ere jail_ere
+	escape_ere param_ere
+	jail -e ' ' |
+	${GREP_CMD} -E "^name=${jail_ere} " |
+	${GREP_CMD} -Eo " ${param_ere}=([^ '\"][^ ]*|'([^'\\]|\\\\.)*'|\"([^\"\\]|\\\\.)*\")( |$)" |
+	${SED_CMD} -E \
+		-e 's/ $//' \
+		-e 's/^[^=]*=//' \
+		-e '/^["'\'']/{ s/^.//
+				s/.$//
+				s/\\(.)/\1/g
+				}' | ${GREP_CMD} ^
+}
+
+is_identifier() {
+	case "${1}" in
+	""|[!A-Za-z_]*|?*[!A-Za-z0-9_]*) return 1;;
+	esac
+	return 0
+}
+
+find_matching_subnets() { # IP
+	local ip version net subnets subnet prefix prefix_version
+	ip="${1}"
+	for net in ${NETWORKS}
+	do
+		is_identifier "${net}" || continue
+		eval "subnets=\"\${NETWORK_${net}_SUBNETS}\""
+		for subnet in ${subnets}
+		do
+			is_identifier "${subnet}" || continue
+			eval "prefix=\"\${NETWORK_${net}_SUBNET_${subnet}_PREFIX}\""
+			${IPADDR_CMD} "${ip}" "in" "${prefix}" && echo ${net} ${subnet}
+		done
+	done
+}
+
+do_jail() {
+	local jail jv path hostname ips ip bridges resolvers net subnet BRIDGE PREFIX ROUTER RESOLVERS var ifaddr ifnum epair prefixlen resolver
+	bridges=""
+	resolvers=""
+	jail="${1}"
+	jv="$(echo -n "${jail}" | ${TR_CMD} -c '[[:alnum:]]' _)"
+	info "jail ${jail}: configuring"
+	path="$(get_jail_param "${jail}" path)" || {
+		err "jail ${jail}: no path"
+		return 69
+	}
+	hostname="$(get_jail_param "${jail}" host.hostname)" || {
+		err "jail ${jail}: no hostname"
+		return 69
+	}
+	ips="$(${GETADDRINFO_CMD} "${hostname}" | ${CUT_CMD} -wf4 | ${SORT_CMD} -u | ${GREP_CMD} ^)" || {
+		err "jail ${jail}: no IP address for hostname ${hostname}"
+		return 69
+	}
+	get_bridge_index() {
+		local _var _br _br1 _i
+		_var="${1}"
+		set -- ${2}
+		_br="${1}"
+		_i=0
+		for _br1 in ${bridges}
+		do
+			case "${_br}" in "${_br1}")
+				eval "${_var}=\"\${_i}\""
+				return
+				;;
+			esac
+			_i=$((_i + 1))
+		done
+		info "jail ${jail}: assigning ${_br} -> epair${_i}b"
+		bridges="${bridges}${_br} "
+		eval "${_var}=\"\${_i}\""
+	}
+	add_resolvers() {
+		local resolver
+		for resolver
+		do
+			case " ${resolvers}" in
+			*" ${resolver} "*)
+				continue
+				;;
+			esac
+			info "jail ${jail}: adding resolver ${resolver}"
+			resolvers="${resolvers}${resolver} "
+		done
+	}
+	for ip in ${ips}
+	do
+		find_matching_subnets "${ip}" > "${tmpdir}/subnets"
+		while read -r net subnet
+		do
+			eval "BRIDGE=\"\${NETWORK_${net}_BRIDGE-}\""
+			for var in PREFIX ROUTER RESOLVERS
+			do
+				eval "${var}=\"\${NETWORK_${net}_SUBNET_${subnet}_${var}-}\""
+			done
+			get_bridge_index ifnum "${BRIDGE}"
+			epair="epair${ifnum}b"
+			prefixlen="$(${IPADDR_CMD} "${PREFIX}" prefixlen)" || {
+				err "cannot get prefix length of net=${net} subnet=${subnet} prefix=${PREFIX}"
+				return 78
+			}
+			ifaddr="${ip}/${prefixlen}"
+			case "$(${IPADDR_CMD} "${PREFIX}" version)" in
+			4)
+				${SYSRC_CMD} -R "${path}" ifconfig_${epair}="inet ${ifaddr}"
+				case "${ROUTER}" in
+				?*)
+					${SYSRC_CMD} -R "${path}" defaultrouter="${ROUTER}"
+					;;
+				esac
+				;;
+			6)
+				${SYSRC_CMD} -R "${path}" "ifconfig_${epair}_ipv6"="inet6 ${ifaddr}"
+				case "${ROUTER}" in
+				?*)
+					${SYSRC_CMD} -R "${path}" ipv6_defaultrouter="${ROUTER}"
+					;;
+				esac
+				;;
+			esac
+			add_resolvers ${RESOLVERS}
+		done < "${tmpdir}/subnets"
+	done
+	case "${resolvers}" in
+	?*)
+		info "jail ${jail}: updating /etc/resolv.conf"
+		for resolver in ${resolvers}
+		do
+			echo "nameserver ${resolver}"
+		done > "${path}/etc/resolv.conf"
+		;;
+	esac
+	case "${bridges}" in
+	?*)
+		info "jail ${jail}: bridging jail on ${bridges% }"
+		${SYSRC_CMD} jail_${jv}_bridge="${bridges% }"
+		;;
+	esac
+	return 0
+}
+
+unset -v tmpdir
+
+cleanup() {
+	case "${tmpdir-}" in
+	?*)
+		debug "cleaning up ${tmpdir}"
+		rm -r "${tmpdir}"
+		tmpdir=
+		;;
+	esac
+}
+
+trap 'cleanup' EXIT HUP INT TERM
+
+tmpdir=$(${MKTEMP_CMD} -d "${TMPDIR:-/tmp}/${progname}.XXXXXX") || exit
+
+main() {
+	log_level=debug
+	local config_file jail status tmpdir
+	config_file="${NETJAIL_CONF_DIR}/config.sh"
+	if [ -f "${config_file}" ]
+	then
+		debug "sourcing ${config_file}"
+		. "${config_file}" || {
+			err "could not source ${config_file} (status $?)"
+			return 78
+		}
+	fi
+	status=0
+	for jail
+	do
+		do_jail "${jail}" || {
+			err "could not configure jail ${jail}"
+			status=1
+		}
+	done
+	return ${status}
+}
+
+main "$@"

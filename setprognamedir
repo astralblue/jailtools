@@ -1,0 +1,45 @@
+#!/bin/sh
+
+quote() {
+	local v n c s
+	s=""
+	for v
+	do
+		echo -n "${s}'"
+		s=" "
+		while :
+		do
+			n="${v#?}"
+			c="${v%"${n}"}"
+			v="${n}"
+			case "${c}" in
+				"") break;;
+				"'") echo -n "'\\''";;
+				*) echo -n "${c}";;
+			esac
+		done
+		echo -n "'"
+	done
+	echo
+}
+
+emit() {
+	case "${SHELL}" in
+		*csh) echo "set ${1}=$(quote "${2}");";;
+		*) echo "${1}=$(quote "${2}");";;
+	esac
+}
+
+unset -v progname progdir progdir_
+case $# in 0) set -- "${0}";; esac
+emit progname "${1##*/}"
+case "${1}" in
+	*/*)
+		emit progdir "${1%/*}"
+		emit progdir_ "${1%/*}/"
+		;;
+	*)
+		emit progdir .
+		emit progdir_ ""
+		;;
+esac
