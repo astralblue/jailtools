@@ -86,7 +86,7 @@ do_jail() {
 	then
 		root_fs="${JAIL_ROOT_FS}/${jail_in_path}${JAIL_ROOT_FS_SUFFIX}"
 		debug "creating jail root ZFS filesystem: ${root_fs}"
-		${ZFS_CMD} create "${root_fs}" || return
+		${ZFS_CMD} create -p "${root_fs}" || return
 		case "$(
 			${DF_CMD} --libxo=json "${jail_path}" |
 			${JQ_CMD} -r '."storage-system-information".filesystem[].name'
@@ -106,7 +106,7 @@ do_jail() {
 		data_fs="${JAIL_DATA_FS}/${jail_in_path}${JAIL_DATA_FS_SUFFIX}"
 		zfs_datasets="${zfs_datasets} ${data_fs}"
 		debug "creating jail data ZFS filesystem: ${data_fs}"
-		${ZFS_CMD} create -o jailed=on -o canmount=off -o mountpoint=/ "${data_fs}" || return
+		${ZFS_CMD} create -p -o jailed=on -o canmount=off -o mountpoint=/ "${data_fs}" || return
 	fi
 	debug "preparing jail root path: ${jail_path}"
 	${INSTALL_CMD} -d -o root -g wheel -m 755 "${jail_path}" || return
