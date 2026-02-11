@@ -188,6 +188,10 @@ ENDEND
 		done
 		echo "}"
 	} > "${jail_conf}"
+	if [ -f "${MKJAIL_CONF_DIR}/hooks/post.sh" ]
+	then
+		. "${MKJAIL_CONF_DIR}/hooks/post.sh" || return
+	fi
 	notice "created jail ${jail}"
 }
 
