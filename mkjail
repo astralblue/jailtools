@@ -123,6 +123,14 @@ do_jail() {
 		${XARGS_CMD} -0 -J {} ${FIND_CMD} -d {} -print0 |
 		${CPIO_CMD} -pdum0 --quiet "${jail_path}"
 	) || return
+	(
+		${INSTALL_CMD} -d -o root -g wheel -m 755 "${jail_path}/usr/local/etc/pkg/repos"
+		cat > "${jail_path}/usr/local/etc/pkg/repos/FreeBSD.conf" << ENDEND
+FreeBSD-ports: { url: "pkg+http://pkg.FreeBSD.org/\${ABI}/${PKG_BRANCH:-"quarterly"}" }
+FreeBSD-ports-kmods: { url: "pkg+http://pkg.FreeBSD.org/\${ABI}/kmods_${PKG_BRANCH}_\${VERSION_MINOR}" }
+FreeBSD-base: { enabled: yes }
+ENDEND
+	) || return
 	debug "installing PkgBase packages: ${pkgbase_pkgs}"
 	jail_pkg install -r "${PKGBASE_REPO_NAME}" -q -y ${pkgbase_pkgs} || return
 #	debug "bootstrapping etcupdate(8)"
@@ -256,6 +264,7 @@ use_zfs_dataset() {
 main() {
 	: ${USE_ZFS_ROOT:=0}
 	: ${USE_ZFS_DATASET:=0}
+	: ${PKG_BRANCH:="quarterly"}
 	log_level=${LOG_LEVEL-notice}
 	local opt OPTIND
 	while getopts :hzdZDL: opt
